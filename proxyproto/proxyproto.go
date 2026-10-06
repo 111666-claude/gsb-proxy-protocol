@@ -2,6 +2,7 @@
 package proxyproto
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"strconv"
@@ -26,6 +27,8 @@ type Header struct {
 	DstIP   string
 	DstPort int
 	TLVs    []KV
+
+	tlvIndex map[byte]int
 }
 
 var signature = []byte{0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a}
@@ -49,7 +52,7 @@ func parseV1(data []byte, c *Counter) (*Header, error) {
 	if !strings.HasSuffix(line, "\r\n") {
 		return nil, errors.New("bad-terminator")
 	}
-	parts := strings.Split(strings.TrimSuffix(line, "\r\n"), " ")
+	parts := strings.Fields(strings.TrimSuffix(line, "\r\n"))
 	h := &Header{}
 	if len(parts) >= 2 && parts[1] == "UNKNOWN" {
 		return h, nil
@@ -68,8 +71,15 @@ func parseV2(data []byte, c *Counter) (*Header, error) {
 	if len(data) < 16 {
 		return nil, errors.New("short")
 	}
+	if !bytes.Equal(data[:12], signature) {
+		return nil, errors.New("bad-signature")
+	}
+	declared := int(binary.BigEndian.Uint16(data[14:16]))
+	if len(data)-16 < declared {
+		return nil, errors.New("short")
+	}
 	famProto := data[13]
-	body := data[16:]
+	body := data[16 : 16+declared]
 	addrLen := 0
 	if famProto&0x0f == 1 {
 		addrLen = 12
@@ -83,17 +93,26 @@ func parseV2(data []byte, c *Counter) (*Header, error) {
 		h.SrcPort = int(binary.BigEndian.Uint16(body[8:10]))
 		h.DstPort = int(binary.BigEndian.Uint16(body[10:12]))
 	}
-	tlvs := body[addrLen:]
+	var tlvs []byte
+	if len(body) >= addrLen {
+		tlvs = body[addrLen:]
+	}
+	h.tlvIndex = map[byte]int{}
 	for i := 0; i+3 <= len(tlvs); {
 		t := tlvs[i]
-		if t == 0 {
-			break
-		}
 		l := int(binary.BigEndian.Uint16(tlvs[i+1:]))
 		if i+3+l > len(tlvs) {
 			break
 		}
-		h.TLVs = append(h.TLVs, KV{t, append([]byte(nil), tlvs[i+3:i+3+l]...)})
+		if t != 0 {
+			kv := KV{t, append([]byte(nil), tlvs[i+3:i+3+l]...)}
+			if pos, ok := h.tlvIndex[t]; ok {
+				h.TLVs[pos] = kv
+			} else {
+				h.tlvIndex[t] = len(h.TLVs)
+				h.TLVs = append(h.TLVs, kv)
+			}
+		}
 		i += 3 + l
 	}
 	return h, nil
@@ -109,11 +128,9 @@ func ipString(b []byte, famProto byte) string {
 
 // TLV 按类型取 TLV。
 func (h *Header) TLV(t byte, c *Counter) ([]byte, bool) {
-	for i := range h.TLVs {
-		c.Scanned++
-		if h.TLVs[i].Type == t {
-			return h.TLVs[i].Value, true
-		}
+	c.Scanned++
+	if i, ok := h.tlvIndex[t]; ok {
+		return h.TLVs[i].Value, true
 	}
 	return nil, false
 }
